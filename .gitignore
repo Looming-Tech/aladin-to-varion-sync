@@ -1,0 +1,8 @@
+# Logs
+logs/
+
+# Local configuration with secrets
+config.ps1
+
+# Archives
+*.zip
