@@ -62,25 +62,34 @@ try {
         Write-Log "Connecting to SQL Server: $SqlServer, Database: $Database (Windows Auth)"
     }
 
-    # Query the database
-    $Query = "SELECT id, dat1, dat2, approved, typeotp, Comments, CreationDate FROM $TableName"
-
     $Connection = New-Object System.Data.SqlClient.SqlConnection($ConnectionString)
     $Connection.Open()
 
+    # --- Query Annual Leave (PlanOtp) ---
+    $Query = "SELECT id, dat1, dat2, approved, typeotp, Comments, CreationDate FROM $TableName"
     $Command = New-Object System.Data.SqlClient.SqlCommand($Query, $Connection)
     $Adapter = New-Object System.Data.SqlClient.SqlDataAdapter($Command)
     $DataSet = New-Object System.Data.DataSet
     $Adapter.Fill($DataSet) | Out-Null
 
+    $LeaveRecords = $DataSet.Tables[0].Rows
+    Write-Log "Retrieved $($LeaveRecords.Count) annual leave records from $TableName"
+
+    # --- Query Sick Leave (BOLN) ---
+    $BolnQuery = "SELECT ID, DAT1, DAT2, Zapoved, TYPEBOLN, DateInput FROM BOLN"
+    $BolnCommand = New-Object System.Data.SqlClient.SqlCommand($BolnQuery, $Connection)
+    $BolnAdapter = New-Object System.Data.SqlClient.SqlDataAdapter($BolnCommand)
+    $BolnDataSet = New-Object System.Data.DataSet
+    $BolnAdapter.Fill($BolnDataSet) | Out-Null
+
+    $SickRecords = $BolnDataSet.Tables[0].Rows
+    Write-Log "Retrieved $($SickRecords.Count) sick leave records from BOLN"
+
     $Connection.Close()
 
-    $Records = $DataSet.Tables[0].Rows
-    $RecordCount = $Records.Count
+    $TotalRecords = $LeaveRecords.Count + $SickRecords.Count
 
-    Write-Log "Retrieved $RecordCount records from $TableName"
-
-    if ($RecordCount -eq 0) {
+    if ($TotalRecords -eq 0) {
         Write-Log "No records to sync. Exiting."
         exit 0
     }
@@ -88,12 +97,13 @@ try {
     # Transform data to API format
     $TimeOffData = @()
 
-    foreach ($Row in $Records) {
+    # Annual leave records
+    foreach ($Row in $LeaveRecords) {
         $StartDate = [DateTime]$Row["dat1"]
         $EndDate = [DateTime]$Row["dat2"]
         $CreatedAt = [DateTime]$Row["CreationDate"]
 
-        $TimeOffRecord = @{
+        $TimeOffData += @{
             year       = $StartDate.Year
             id         = [int]$Row["id"]
             start_date = $StartDate.ToString("yyyy-MM-dd")
@@ -102,9 +112,31 @@ try {
             approved   = [int]$Row["approved"]
             comments   = if ($null -eq $Row["Comments"]) { "" } else { [string]$Row["Comments"] }
             created_at = $CreatedAt.ToString("yyyy-MM-ddTHH:mm")
+            task_type  = "annual_leave"
+        }
+    }
+
+    # Sick leave records
+    foreach ($Row in $SickRecords) {
+        $StartDate = [DateTime]$Row["DAT1"]
+        $EndDate = [DateTime]$Row["DAT2"]
+        $CreatedAt = if ($null -ne $Row["DateInput"] -and $Row["DateInput"] -isnot [DBNull]) {
+            ([DateTime]$Row["DateInput"]).ToString("yyyy-MM-ddTHH:mm")
+        } else {
+            $StartDate.ToString("yyyy-MM-ddTHH:mm")
         }
 
-        $TimeOffData += $TimeOffRecord
+        $TimeOffData += @{
+            year       = $StartDate.Year
+            id         = [int]$Row["ID"]
+            start_date = $StartDate.ToString("yyyy-MM-dd")
+            end_date   = $EndDate.ToString("yyyy-MM-dd")
+            type       = [int]$Row["TYPEBOLN"]
+            approved   = [int]$Row["Zapoved"]
+            comments   = ""
+            created_at = $CreatedAt
+            task_type  = "sick_leave"
+        }
     }
 
     # Build API payload
@@ -112,14 +144,13 @@ try {
         employees_timeoff_data = $TimeOffData
     } | ConvertTo-Json -Depth 10
 
-    Write-Log "Sending $RecordCount records to Varion API..."
+    Write-Log "Sending $TotalRecords records to Varion API ($($LeaveRecords.Count) annual leave + $($SickRecords.Count) sick leave)..."
 
-    # Send to API
-    $Headers = @{
-        "Content-Type" = "application/json"
-    }
+    # Send to API — encode body as UTF-8 bytes so Content-Length matches actual size
+    # (PowerShell miscalculates Content-Length when the JSON contains non-ASCII characters)
+    $PayloadBytes = [System.Text.Encoding]::UTF8.GetBytes($Payload)
 
-    $Response = Invoke-RestMethod -Uri $ApiUrl -Method POST -Body $Payload -Headers $Headers
+    $Response = Invoke-RestMethod -Uri $ApiUrl -Method POST -Body $PayloadBytes -ContentType "application/json; charset=utf-8"
 
     Write-Log "API Response: $($Response | ConvertTo-Json -Compress)"
     Write-Log "Sync completed successfully!"
